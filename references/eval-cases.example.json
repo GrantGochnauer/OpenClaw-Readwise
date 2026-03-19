@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "mode": "known_topic_lookup",
+      "query": "openclaw",
+      "expectAnyTitleContains": ["openclaw", "claw"],
+      "rejectTitleContains": ["coupon", "register"],
+      "minDocumentCount": 1,
+      "maxDocumentCount": 6,
+      "notes": "Basic known-topic retrieval should return directly related items."
+    },
+    {
+      "mode": "broad_conceptual_synthesis",
+      "query": "product strategy",
+      "expectAnyTitleContains": ["product", "strategy", "roadmap", "positioning"],
+      "rejectTitleContains": ["coupon", "register", "promo"],
+      "minDocumentCount": 1,
+      "maxDocumentCount": 6,
+      "notes": "Broad conceptual retrieval should control drift while surfacing strong anchors."
+    },
+    {
+      "mode": "specific_technical_compound",
+      "query": "tenant isolation",
+      "expectAnyTitleContains": ["tenant", "isolation", "multitenant", "multi-tenant"],
+      "rejectTitleContains": ["covid", "vaccine", "coupon"],
+      "minDocumentCount": 1,
+      "maxDocumentCount": 6,
+      "notes": "Technical compound queries should prioritize precise technical anchors."
+    }
+  ]
+}

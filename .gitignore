@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+.env
+.env.*
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data
+/data/
+*.sqlite3
+*.db
+
+# Export/runtime artifacts
+exports/
+tmp/
