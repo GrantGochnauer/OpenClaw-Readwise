@@ -90,6 +90,12 @@ STRONG_DOMAIN_HINTS = {
     "substack.com", "medium.com", "stratechery.com", "martinfowler.com", "paulgraham.com", "amazon.com",
 }
 
+TECHNICAL_COMPOUND_TERMS = {
+    "tenant", "isolation", "permissions", "policy", "access", "control", "security", "context",
+    "audit", "logging", "row", "level", "authorization", "identity", "boundary", "boundaries",
+    "propagation", "inheritance", "entitlement",
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -481,17 +487,29 @@ class ReadwiseStore:
             tag_preference_strength = 2
         elif tag_intent == "implied" or tag_filters:
             tag_preference_strength = 1
+        technical_terms = [term for term in terms if term in TECHNICAL_COMPOUND_TERMS]
+        technical_term_count = len(technical_terms)
+        technical_family_count = len([term for term in concept_groups if term in TECHNICAL_COMPOUND_TERMS])
+        looks_broad_business = len(terms) <= 3 and len(vague_terms) >= 1 and technical_term_count <= 1
         is_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity <= 2 and tag_preference_strength == 0
         is_very_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity == 0 and tag_preference_strength == 0
+        technical_compound_bias = bool(
+            len(terms) >= 2
+            and tag_preference_strength == 0
+            and not looks_broad_business
+            and (
+                technical_term_count >= 2
+                or technical_family_count >= 2
+                or (technical_term_count >= 1 and technical_family_count >= 1 and specificity >= 2)
+            )
+        )
         mode = "known_topic_lookup"
         if tag_filters and tag_preference_strength > 0:
             mode = "tag_constrained_retrieval"
-        elif len(terms) >= 2 and any(term in {"tenant", "isolation", "permissions", "policy", "access", "control", "security", "context", "audit", "logging", "row", "level"} for term in terms):
+        elif technical_compound_bias:
             mode = "specific_technical_compound"
         elif is_broad:
             mode = "broad_conceptual_synthesis"
-        elif len(terms) >= 2 and concept_groups:
-            mode = "specific_technical_compound"
         return {
             "terms": terms,
             "tagFilters": tag_filters,
@@ -504,6 +522,9 @@ class ReadwiseStore:
             "isBroad": is_broad,
             "isVeryBroad": is_very_broad,
             "conceptGroups": concept_groups,
+            "technicalTerms": technical_terms,
+            "technicalTermCount": technical_term_count,
+            "technicalFamilyCount": technical_family_count,
             "mode": mode,
         }
 
@@ -555,6 +576,7 @@ class ReadwiseStore:
         query_profile = self._query_profile(query or "")
         tag_filters = query_profile.get("tagFilters") or []
         tag_match = self._tag_match_score(tags, query_profile)
+        token_counts = self._token_counts(" ".join(filter(None, [title, summary, notes, chunk_text, " ".join(tags)])))
 
         score += min(self._text_signal_score(title), 20)
         score += min(self._text_signal_score(summary), 20)
@@ -645,6 +667,20 @@ class ReadwiseStore:
             score += matched_fields * 3
             if query_profile.get("isBroad") and (title_concept + tag_concept + summary_concept + chunk_concept) == 0:
                 score -= 16
+        if query_profile.get("mode") == "specific_technical_compound":
+            technical_term_hits = sum(1 for term in qterms if term in token_counts)
+            family_coverage = self._concept_family_coverage(" ".join(filter(None, [title, summary, chunk_text, tag_text])), query_profile)
+            covered_families = sum(1 for value in family_coverage.values() if value > 0)
+            score += technical_term_hits * 6
+            if technical_term_hits >= 2:
+                score += 10
+            score += covered_families * 8
+            if technical_term_hits <= 1 and covered_families <= 1:
+                score -= 26
+            if technical_term_hits < max(2, min(len(qterms), 3)):
+                score -= 12
+            if covered_families == 0:
+                score -= 18
         if self._looks_like_digest(doc):
             score -= 20
             if len(qterms) <= 2:
@@ -1278,8 +1314,28 @@ class ReadwiseStore:
         seen_ids = set()
         secondary_rows = []
         enough_tag_primary_candidates = len(primary_ids) >= max(limit * 4, 16)
+        enough_technical_primary_candidates = len(primary_ids) >= max(limit * 3, 12)
         skip_body_pass = bool(tag_preference_strength >= 2 and enough_tag_primary_candidates)
-        if not broad_multi_term and not skip_body_pass:
+        technical_body_limit = max(limit * 4, 18)
+        if specific_multi_term and not enough_technical_primary_candidates:
+            technical_term_clauses = []
+            technical_term_params: List[Any] = []
+            for term in query_terms[:4]:
+                like = f"%{term}%"
+                technical_term_clauses.append("(lower(coalesce(summary, '')) LIKE ? OR lower(coalesce(content, '')) LIKE ?)")
+                technical_term_params.extend([like, like])
+            technical_body_where = " AND ".join(technical_term_clauses) if technical_term_clauses else body_where
+            secondary_rows = self.conn.execute(
+                f"""
+                SELECT *
+                FROM documents
+                WHERE {technical_body_where}
+                ORDER BY updated_at DESC, saved_at DESC
+                LIMIT ?
+                """,
+                (*technical_term_params, technical_body_limit),
+            ).fetchall()
+        elif not broad_multi_term and not skip_body_pass:
             secondary_rows = self.conn.execute(
                 f"""
                 SELECT *
@@ -1336,7 +1392,10 @@ class ReadwiseStore:
                 gate_family_coverage = self._concept_family_coverage(gate_text, profile)
                 gate_drift = self._concept_drift_score(gate_text, profile)
                 covered_families = sum(1 for value in gate_family_coverage.values() if value > 0)
+                technical_term_hits = sum(1 for term in query_terms if term in self._token_counts(gate_text))
                 if gate_drift >= 8 and gate_overlap < len(query_terms):
+                    continue
+                if technical_term_hits < max(2, min(len(query_terms), 3)) and covered_families < max(1, min(len(profile.get("conceptGroups") or {}), 2)):
                     continue
                 if gate_overlap < len(query_terms):
                     if len(profile.get("conceptGroups") or {}) >= 2:
@@ -1601,6 +1660,10 @@ class ReadwiseStore:
             title_drift = self._concept_drift_score(doc.get("title") or "", profile)
             summary_drift = self._concept_drift_score(doc.get("summary") or "", profile)
             contrast_signal = self._has_contrast_signal(" ".join(filter(None, [doc.get("title"), doc.get("summary"), " ".join((chunk.get("text") or "") for chunk in (doc.get("contentChunks") or doc.get("chunks") or [])[:2]) ])))
+            technical_context_text = " ".join(filter(None, [doc.get("title") or "", doc.get("summary") or "", (doc.get("content") or "")[:2500], " ".join(tags)]))
+            technical_token_counts = self._token_counts(technical_context_text)
+            technical_term_hits = sum(1 for term in query_terms if term in technical_token_counts)
+            covered_families = sum(1 for value in family_coverage.values() if value > 0)
 
             min_quality = 24 if has_manual_tags else 38
             if strict_mode:
@@ -1622,6 +1685,16 @@ class ReadwiseStore:
             elif profile.get("tagPreferenceStrength", 0) > 0 and tag_filters and (tag_match.get("exactRequested", 0) == 0) and not has_manual_tags:
                 rejection_notes.append(f"tag-intent-no-match:{doc.get('title') or '[untitled]'}")
                 continue
+            if profile.get("mode") == "specific_technical_compound":
+                if technical_term_hits < max(2, min(len(query_terms), 3)) and covered_families < max(1, min(len(profile.get("conceptGroups") or {}), 2)):
+                    rejection_notes.append(f"technical-joint-support-miss:{doc.get('title') or '[untitled]'}")
+                    continue
+                if technical_term_hits <= 1 and (title_drift + summary_drift) >= 6:
+                    rejection_notes.append(f"technical-drift:{doc.get('title') or '[untitled]'}")
+                    continue
+                if len(query_terms) >= 2 and technical_term_hits < 2 and title_support == 0 and tag_support == 0 and phrase_support == 0:
+                    rejection_notes.append(f"technical-no-literal-anchor:{doc.get('title') or '[untitled]'}")
+                    continue
             if counterpoint_mode and contrast_signal:
                 quality_score += 8
             if profile["isBroad"] and (title_drift + summary_drift) >= 8 and not has_manual_tags:
@@ -1742,6 +1815,8 @@ class ReadwiseStore:
                         "tagConcept": tag_concept,
                         "summaryConcept": summary_concept,
                         "requestedTagHits": tag_match.get("exactRequested", 0),
+                        "technicalTermHits": technical_term_hits,
+                        "coveredTechnicalFamilies": covered_families,
                     },
                     "selectionSignals": {
                         "hasManualTags": has_manual_tags,
@@ -1755,6 +1830,8 @@ class ReadwiseStore:
                         "requestedTagTerms": profile.get("tagRequestedTerms") or [],
                         "titleRequestedHits": sum(1 for tag in (profile.get("tagRequestedTerms") or []) if tag and tag in (doc.get("title") or "").lower()),
                         "summaryRequestedHits": sum(1 for tag in (profile.get("tagRequestedTerms") or []) if tag and tag in (doc.get("summary") or "").lower()),
+                        "technicalQuery": profile.get("mode") == "specific_technical_compound",
+                        "technicalContextTokens": sorted([term for term in query_terms if term in technical_token_counts])[:6],
                     },
                     "chunks": chunks,
                 }

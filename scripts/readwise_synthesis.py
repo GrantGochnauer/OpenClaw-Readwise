@@ -620,6 +620,13 @@ def build_synthesis_packet(evidence: Dict[str, Any]) -> Dict[str, Any]:
                 reasons.append("matched requested tags")
         elif strength.get("tagSupport"):
             reasons.append("manual tags")
+        if signals.get("technicalQuery"):
+            if strength.get("coveredTechnicalFamilies"):
+                reasons.append(f"covered technical families: {strength.get('coveredTechnicalFamilies')}")
+            if strength.get("technicalTermHits"):
+                reasons.append(f"technical term hits: {strength.get('technicalTermHits')}")
+            if signals.get("technicalContextTokens"):
+                reasons.append(f"technical context: {', '.join((signals.get('technicalContextTokens') or [])[:3])}")
         if signals.get("titleRequestedHits"):
             reasons.append("title mentions requested tag")
         elif strength.get("titleSupport"):

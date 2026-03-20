@@ -1282,6 +1282,13 @@ def render_text(payload: Dict[str, Any]) -> str:
                     why_bits.append("requested tag match")
             elif why.get("tagSupport"):
                 why_bits.append("tag match")
+            if signals.get("technicalQuery"):
+                if why.get("coveredTechnicalFamilies"):
+                    why_bits.append(f"covered technical families: {why.get('coveredTechnicalFamilies')}")
+                if why.get("technicalTermHits"):
+                    why_bits.append(f"technical term hits: {why.get('technicalTermHits')}")
+                if signals.get("technicalContextTokens"):
+                    why_bits.append(f"technical context: {', '.join((signals.get('technicalContextTokens') or [])[:3])}")
             if signals.get("titleRequestedHits"):
                 why_bits.append("title mentions requested tag")
             elif why.get("titleSupport"):
