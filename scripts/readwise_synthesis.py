@@ -610,10 +610,22 @@ def build_synthesis_packet(evidence: Dict[str, Any]) -> Dict[str, Any]:
     for doc in documents:
         reasons = []
         strength = doc.get("matchStrength") or {}
-        if strength.get("tagSupport"):
+        signals = doc.get("selectionSignals") or {}
+        tag_match = signals.get("tagMatch") or {}
+        requested_terms = signals.get("requestedTagTerms") or []
+        if tag_match.get("exactRequested"):
+            if requested_terms:
+                reasons.append(f"matched requested tags: {', '.join(requested_terms[:3])}")
+            else:
+                reasons.append("matched requested tags")
+        elif strength.get("tagSupport"):
             reasons.append("manual tags")
-        if strength.get("titleSupport"):
+        if signals.get("titleRequestedHits"):
+            reasons.append("title mentions requested tag")
+        elif strength.get("titleSupport"):
             reasons.append("title match")
+        if signals.get("summaryRequestedHits"):
+            reasons.append("summary mentions requested tag")
         if strength.get("phraseSupport"):
             reasons.append("phrase hit")
         if (doc.get("selectionSignals") or {}).get("contrastSignal"):

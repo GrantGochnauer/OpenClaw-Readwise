@@ -1044,7 +1044,7 @@ def run_command(args: argparse.Namespace, connector: ReadwiseConnector) -> Dict[
                 signals = d.get("selectionSignals") or {}
                 if vague_terms and not (title_tokens & vague_terms) and not (strength.get("tagSupport") or strength.get("phraseSupport")):
                     drift_titles.append(d.get("title"))
-                if (strength.get("titleSupport", 0) + strength.get("tagSupport", 0) + strength.get("phraseSupport", 0)) < 2:
+                if (strength.get("titleSupport", 0) + strength.get("tagSupport", 0) + strength.get("phraseSupport", 0)) < 2 and (strength.get("requestedTagHits", 0) == 0):
                     weak_anchor_titles.append(d.get("title"))
                 if broad and not signals.get("hasManualTags") and (signals.get("titleDrift", 0) or signals.get("summaryDrift", 0)):
                     if d.get("title") not in drift_titles:
@@ -1271,11 +1271,23 @@ def render_text(payload: Dict[str, Any]) -> str:
         lines.append("Documents:")
         for idx, doc in enumerate(payload.get("documents", []), start=1):
             why = doc.get("matchStrength") or {}
+            signals = doc.get("selectionSignals") or {}
+            tag_match = signals.get("tagMatch") or {}
+            requested_terms = signals.get("requestedTagTerms") or []
             why_bits = []
-            if why.get("tagSupport"):
+            if tag_match.get("exactRequested"):
+                if requested_terms:
+                    why_bits.append(f"requested tags: {', '.join(requested_terms[:3])}")
+                else:
+                    why_bits.append("requested tag match")
+            elif why.get("tagSupport"):
                 why_bits.append("tag match")
-            if why.get("titleSupport"):
+            if signals.get("titleRequestedHits"):
+                why_bits.append("title mentions requested tag")
+            elif why.get("titleSupport"):
                 why_bits.append("title match")
+            if signals.get("summaryRequestedHits"):
+                why_bits.append("summary mentions requested tag")
             if why.get("phraseSupport"):
                 why_bits.append("phrase hit")
             if (doc.get("selectionSignals") or {}).get("contrastSignal"):

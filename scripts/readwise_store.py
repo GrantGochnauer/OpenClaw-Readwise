@@ -28,10 +28,10 @@ LOW_SIGNAL_TOKENS = {
 }
 
 STOP_TOKENS = {
-    "about", "after", "also", "among", "been", "being", "between", "could", "from", "have", "into",
+    "about", "after", "also", "among", "and", "been", "being", "between", "could", "from", "have", "into",
     "just", "more", "most", "over", "some", "such", "than", "that", "their", "there", "these",
     "they", "this", "those", "through", "under", "using", "what", "when", "where", "which", "while",
-    "with", "your", "readwise", "reader",
+    "with", "your", "readwise", "reader", "show", "docs", "doc", "tagged", "saved", "list", "tell",
 }
 
 BROAD_CATEGORY_PENALTIES = {
@@ -196,12 +196,40 @@ class ReadwiseStore:
     @classmethod
     def _extract_tag_filters(cls, query: str) -> List[str]:
         tags: List[str] = []
+
+        def add_tag(value: str) -> None:
+            norm = cls._normalize_token(value)
+            if norm and norm not in tags:
+                tags.append(norm)
+
+        lowered = query.lower()
         for raw in query.split():
             token = raw.strip()
-            if token.lower().startswith("tag:") and len(token) > 4:
-                norm = cls._normalize_token(token[4:])
-                if norm and norm not in tags:
-                    tags.append(norm)
+            token_lower = token.lower()
+            if token_lower.startswith("tag:") and len(token) > 4:
+                add_tag(token[4:])
+            elif token_lower.startswith("tags:") and len(token) > 5:
+                for part in re.split(r"[,/|]", token[5:]):
+                    add_tag(part)
+
+        patterns = [
+            r"\bdocs?\s+tagged\s+([a-z0-9_\-+/ ]{2,80})",
+            r"\bdocuments?\s+tagged\s+([a-z0-9_\-+/ ]{2,80})",
+            r"\bwhat\s+have\s+i\s+tagged\s+about\s+([a-z0-9_\-+/ ]{2,80})",
+            r"\bwhat\s+have\s+i\s+saved\s+under\s+([a-z0-9_\-+/ ]{2,80})",
+            r"\bwhat\s+in\s+my\s+([a-z0-9_\-+/ ]{2,80})\s+tags\b",
+            r"\bin\s+my\s+([a-z0-9_\-+/ ]{2,80})\s+tags\b",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, lowered):
+                phrase = (match.group(1) or "").strip(" ?!.,:;()[]{}")
+                if not phrase:
+                    continue
+                parts = re.split(r"\s*(?:/|,|\band\b|\b&\b|\+)\s*", phrase)
+                for part in parts:
+                    cleaned = part.strip()
+                    if cleaned:
+                        add_tag(cleaned)
         return tags
 
     @classmethod
@@ -425,6 +453,7 @@ class ReadwiseStore:
     def _query_profile(cls, query: str) -> Dict[str, Any]:
         terms = cls._query_terms(query)
         tag_filters = cls._extract_tag_filters(query)
+        lowered = query.lower()
         vague_terms = [term for term in terms if term in VAGUE_TOPIC_TOKENS]
         specificity = 0
         if tag_filters:
@@ -436,10 +465,26 @@ class ReadwiseStore:
         for term in terms:
             if term in CONCEPT_ANCHOR_GROUPS:
                 concept_groups[term] = sorted(CONCEPT_ANCHOR_GROUPS[term])
-        is_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity <= 2
-        is_very_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity == 0
+        explicit_tag_intent = ("tag:" in lowered) or ("tags:" in lowered)
+        implied_tag_intent = bool(
+            tag_filters and (
+                re.search(r"\btagged\b", lowered)
+                or re.search(r"\bunder\b", lowered)
+                or re.search(r"\bin\s+my\s+.+\s+tags\b", lowered)
+                or re.search(r"\bwhat\s+have\s+i\s+tagged\s+about\b", lowered)
+            )
+        )
+        tag_intent = "explicit" if explicit_tag_intent else ("implied" if implied_tag_intent else "none")
+        tag_only_bias = bool(tag_filters and re.search(r"\b(show\s+me|what\s+have\s+i\s+saved\s+under|what\s+in\s+my|docs?\s+tagged|documents?\s+tagged)\b", lowered))
+        tag_preference_strength = 0
+        if tag_intent == "explicit" or tag_only_bias:
+            tag_preference_strength = 2
+        elif tag_intent == "implied" or tag_filters:
+            tag_preference_strength = 1
+        is_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity <= 2 and tag_preference_strength == 0
+        is_very_broad = len(terms) <= 2 and len(vague_terms) >= 1 and specificity == 0 and tag_preference_strength == 0
         mode = "known_topic_lookup"
-        if tag_filters:
+        if tag_filters and tag_preference_strength > 0:
             mode = "tag_constrained_retrieval"
         elif len(terms) >= 2 and any(term in {"tenant", "isolation", "permissions", "policy", "access", "control", "security", "context", "audit", "logging", "row", "level"} for term in terms):
             mode = "specific_technical_compound"
@@ -450,12 +495,49 @@ class ReadwiseStore:
         return {
             "terms": terms,
             "tagFilters": tag_filters,
+            "tagRequestedTerms": list(tag_filters),
+            "tagIntent": tag_intent,
+            "tagPreferenceStrength": tag_preference_strength,
+            "tagOnlyBias": tag_only_bias,
             "vagueTerms": vague_terms,
             "specificity": specificity,
             "isBroad": is_broad,
             "isVeryBroad": is_very_broad,
             "conceptGroups": concept_groups,
             "mode": mode,
+        }
+
+    @classmethod
+    def _tag_match_score(cls, doc_tags: List[str], query_profile: Dict[str, Any]) -> Dict[str, Any]:
+        requested = [cls._normalize_token(tag) for tag in (query_profile.get("tagRequestedTerms") or []) if cls._normalize_token(tag)]
+        normalized_tags = [cls._normalize_token(tag) for tag in (doc_tags or []) if cls._normalize_token(tag)]
+        requested_set = set(requested)
+        doc_tag_set = set(normalized_tags)
+        exact_requested = sum(1 for tag in requested if tag in doc_tag_set)
+        overlap_ratio = (exact_requested / len(requested_set)) if requested_set else 0.0
+        has_any_requested = exact_requested > 0
+        score = 0
+        if has_any_requested:
+            score += exact_requested * 14
+            if exact_requested >= 2:
+                score += 8
+            if requested_set and exact_requested == len(requested_set):
+                score += 10
+            if query_profile.get("tagIntent") == "implied":
+                score += 8
+            elif query_profile.get("tagIntent") == "explicit":
+                score += 12
+        elif requested_set and query_profile.get("tagPreferenceStrength", 0) >= 2:
+            score -= 22
+        elif requested_set:
+            score -= 10
+        return {
+            "exactRequested": exact_requested,
+            "requestedCount": len(requested_set),
+            "overlapRatio": round(overlap_ratio, 3),
+            "hasAnyRequested": has_any_requested,
+            "strongMatch": bool(has_any_requested and (exact_requested >= 2 or overlap_ratio >= 0.99 or query_profile.get("tagPreferenceStrength", 0) >= 2)),
+            "score": score,
         }
 
     def _document_quality_score(self, doc: Dict[str, Any], *, query: Optional[str] = None, query_terms: Optional[List[str]] = None) -> int:
@@ -471,7 +553,8 @@ class ReadwiseStore:
         tags = doc.get("tags") or []
         qterms = query_terms if query_terms is not None else self._query_terms(query or "")
         query_profile = self._query_profile(query or "")
-        tag_filters = self._extract_tag_filters(query or "")
+        tag_filters = query_profile.get("tagFilters") or []
+        tag_match = self._tag_match_score(tags, query_profile)
 
         score += min(self._text_signal_score(title), 20)
         score += min(self._text_signal_score(summary), 20)
@@ -510,6 +593,10 @@ class ReadwiseStore:
         summary_overlap = self._text_overlap_score(summary, qterms)
         note_overlap = self._text_overlap_score(notes, qterms)
         chunk_overlap = self._text_overlap_score(chunk_text, qterms)
+        requested_tag_terms = [tag for tag in (query_profile.get("tagRequestedTerms") or []) if tag]
+        title_requested_hits = sum(1 for tag in requested_tag_terms if tag in title.lower())
+        summary_requested_hits = sum(1 for tag in requested_tag_terms if tag in summary.lower())
+        chunk_requested_hits = sum(1 for tag in requested_tag_terms if tag in chunk_text.lower())
         title_concept = self._concept_anchor_score(title, query_profile)
         tag_concept = self._concept_anchor_score(tag_text, query_profile)
         summary_concept = self._concept_anchor_score(summary, query_profile)
@@ -522,6 +609,11 @@ class ReadwiseStore:
         score += summary_overlap * 2
         score += note_overlap
         score += chunk_overlap
+        score += tag_match.get("score", 0)
+        if requested_tag_terms and query_profile.get("tagPreferenceStrength", 0) > 0:
+            score += title_requested_hits * 12
+            score += summary_requested_hits * 5
+            score += min(chunk_requested_hits * 3, 6)
         score += title_concept * 2
         score += tag_concept * 2
         score += summary_concept
@@ -533,10 +625,10 @@ class ReadwiseStore:
         score += self._phrase_score(title, query or "") * 2
         score += self._phrase_score(summary, query or "")
         if tag_filters:
-            matched_tag_filters = sum(1 for tag in tag_filters if tag in self._token_counts(tag_text))
-            score += matched_tag_filters * 30
+            matched_tag_filters = tag_match.get("exactRequested", 0)
+            score += matched_tag_filters * 18
             if matched_tag_filters < len(tag_filters):
-                score -= (len(tag_filters) - matched_tag_filters) * 18
+                score -= (len(tag_filters) - matched_tag_filters) * (22 if query_profile.get("tagPreferenceStrength", 0) >= 2 else 14)
 
         topical_support = title_overlap + tag_overlap + summary_overlap + note_overlap
         if qterms and topical_support == 0 and chunk_overlap > 0:
@@ -568,7 +660,12 @@ class ReadwiseStore:
             score -= 8
         return score
 
-    def _clean_chunks(self, chunks: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
+    def _clean_chunks(self, chunks: List[Dict[str, Any]], *, limit: int, query_profile: Optional[Dict[str, Any]] = None, title: str = "", summary: str = "", tags: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        query_profile = query_profile or {}
+        requested_tags = " ".join(query_profile.get("tagRequestedTerms") or [])
+        title_terms = self._query_terms(title)
+        summary_terms = self._query_terms(summary)
+        anchor_terms = sorted(set(title_terms + summary_terms + list(query_profile.get("terms") or [])))
         ranked = []
         for chunk in chunks:
             if not isinstance(chunk, dict):
@@ -577,7 +674,16 @@ class ReadwiseStore:
             signal = self._text_signal_score(text)
             if signal <= 0:
                 continue
-            ranked.append((signal, chunk))
+            score = signal
+            if anchor_terms:
+                score += self._text_overlap_score(text, anchor_terms)
+            if requested_tags:
+                score += self._text_overlap_score(text, self._query_terms(requested_tags)) * 2
+            if tags:
+                score += min(self._text_overlap_score(text, self._query_terms(" ".join(tags))), 8)
+            if len(text.strip()) < 120:
+                score -= 4
+            ranked.append((score, chunk))
         ranked.sort(key=lambda x: x[0], reverse=True)
         return [chunk for _, chunk in ranked[:limit]]
 
@@ -1113,11 +1219,15 @@ class ReadwiseStore:
         mode = profile.get("mode") or "known_topic_lookup"
         broad_multi_term = bool(mode == "broad_conceptual_synthesis" and len(query_terms) >= 2)
         specific_multi_term = bool(mode == "specific_technical_compound" and len(query_terms) >= 2)
+        tag_filters = profile.get("tagFilters") or []
+        tag_preference_strength = int(profile.get("tagPreferenceStrength") or 0)
 
         title_tag_clauses = []
         title_tag_params: List[Any] = []
         body_clauses = []
         body_params: List[Any] = []
+        tag_clauses = []
+        tag_params: List[Any] = []
 
         for term in ([query.lower()] + query_terms)[:6]:
             like = f"%{term}%"
@@ -1130,9 +1240,28 @@ class ReadwiseStore:
             body_clauses.append("lower(coalesce(content, '')) LIKE ?")
             body_params.extend([like, like])
 
+        for tag in tag_filters[:6]:
+            like = f'%"{tag}"%'
+            tag_clauses.append("lower(coalesce(tags_json, '')) LIKE ?")
+            tag_params.append(like)
+
         title_tag_where = " OR ".join(title_tag_clauses) if title_tag_clauses else "1=1"
         body_where = " OR ".join(body_clauses) if body_clauses else "1=1"
+        tag_where = " OR ".join(tag_clauses) if tag_clauses else "0=1"
         candidate_limit = max(limit * 8, 40)
+
+        tag_rows = []
+        if tag_clauses:
+            tag_rows = self.conn.execute(
+                f"""
+                SELECT *
+                FROM documents
+                WHERE {tag_where}
+                ORDER BY updated_at DESC, saved_at DESC
+                LIMIT ?
+                """,
+                (*tag_params, candidate_limit),
+            ).fetchall()
 
         primary_rows = self.conn.execute(
             f"""
@@ -1145,10 +1274,12 @@ class ReadwiseStore:
             (*title_tag_params, candidate_limit),
         ).fetchall()
 
-        primary_ids = {row[0] for row in primary_rows}
+        primary_ids = {row[0] for row in list(tag_rows) + list(primary_rows)}
         seen_ids = set()
         secondary_rows = []
-        if not broad_multi_term:
+        enough_tag_primary_candidates = len(primary_ids) >= max(limit * 4, 16)
+        skip_body_pass = bool(tag_preference_strength >= 2 and enough_tag_primary_candidates)
+        if not broad_multi_term and not skip_body_pass:
             secondary_rows = self.conn.execute(
                 f"""
                 SELECT *
@@ -1159,7 +1290,7 @@ class ReadwiseStore:
                 """,
                 (*body_params, candidate_limit),
             ).fetchall()
-        elif len(primary_rows) < max(limit * 3, 18):
+        elif broad_multi_term and len(primary_rows) < max(limit * 3, 18):
             secondary_rows = self.conn.execute(
                 f"""
                 SELECT *
@@ -1172,7 +1303,7 @@ class ReadwiseStore:
             ).fetchall()
 
         results = []
-        for row in list(primary_rows) + list(secondary_rows):
+        for row in list(tag_rows) + list(primary_rows) + list(secondary_rows):
             document_id = row[0]
             if document_id in seen_ids:
                 continue
@@ -1180,9 +1311,19 @@ class ReadwiseStore:
                 continue
             seen_ids.add(document_id)
             doc = self._row_to_document(row)
+            tag_match = self._tag_match_score(doc.get("tags") or [], profile)
+            doc["tagMatch"] = tag_match
             doc["cacheScore"] = self._document_quality_score(doc, query=query, query_terms=query_terms)
+            if tag_preference_strength > 0:
+                doc["cacheScore"] += tag_match.get("score", 0)
+                if tag_match.get("exactRequested", 0) == 0 and tag_preference_strength >= 2:
+                    doc["cacheScore"] -= 18
             doc["qualityScore"] = doc["cacheScore"]
             title_tag_text = " ".join(filter(None, [doc.get("title") or "", " ".join(doc.get("tags") or []), doc.get("author") or ""]))
+            if tag_preference_strength >= 2 and tag_filters and tag_match.get("exactRequested", 0) == 0:
+                gate_text = " ".join(filter(None, [title_tag_text, doc.get("summary") or "", (doc.get("content") or "")[:1200]]))
+                if self._text_overlap_score(gate_text, query_terms) < max(1, len(query_terms) - 1):
+                    continue
             if broad_multi_term:
                 if self._text_overlap_score(title_tag_text, query_terms) == 0 and self._concept_anchor_score(title_tag_text, profile) == 0 and not (doc.get("tags") or []):
                     continue
@@ -1375,6 +1516,7 @@ class ReadwiseStore:
 
         profile = self._query_profile(query)
         query_terms = profile["terms"]
+        tag_filters = profile.get("tagFilters") or []
         effective_doc_limit = min(doc_limit, 2) if (strict_mode and profile["isBroad"] and not broad_mode) else doc_limit
         effective_highlight_limit = min(highlight_limit, 4) if (strict_mode and profile["isBroad"] and not broad_mode) else highlight_limit
         if broad_mode:
@@ -1443,6 +1585,7 @@ class ReadwiseStore:
             quality_score = doc.get("qualityScore", self._document_quality_score(doc, query=query, query_terms=query_terms))
             hybrid_score = float(doc.get("hybridScore", quality_score) or quality_score)
             tags = doc.get("tags") or []
+            tag_match = doc.get("tagMatch") or self._tag_match_score(tags, profile)
             title_summary_tags = " ".join(filter(None, [doc.get("title"), doc.get("summary"), " ".join(tags)]))
             direct_support = self._text_overlap_score(title_summary_tags, query_terms)
             title_support = self._text_overlap_score(doc.get("title") or "", query_terms)
@@ -1470,6 +1613,14 @@ class ReadwiseStore:
                 min_quality -= 6
             if tagged_only and not has_manual_tags:
                 rejection_notes.append(f"untagged:{doc.get('title') or '[untitled]'}")
+                continue
+            if profile.get("tagOnlyBias") and (tag_match.get("exactRequested", 0) == 0):
+                literal_support = title_support + summary_concept + phrase_support
+                if literal_support < max(2, len(query_terms)):
+                    rejection_notes.append(f"tag-only-bias-no-tag-hit:{doc.get('title') or '[untitled]'}")
+                    continue
+            elif profile.get("tagPreferenceStrength", 0) > 0 and tag_filters and (tag_match.get("exactRequested", 0) == 0) and not has_manual_tags:
+                rejection_notes.append(f"tag-intent-no-match:{doc.get('title') or '[untitled]'}")
                 continue
             if counterpoint_mode and contrast_signal:
                 quality_score += 8
@@ -1538,12 +1689,18 @@ class ReadwiseStore:
             cap = SOURCE_TYPE_CAPS.get(category, max(1, effective_doc_limit // 2 or 1))
             if broad_mode:
                 cap += 1
+            if profile.get("tagPreferenceStrength", 0) > 0 and tag_match.get("hasAnyRequested"):
+                cap += 1
+            if profile.get("tagOnlyBias") and tag_match.get("strongMatch"):
+                cap += 1
             if source_tier == "weak" and len(evidence_docs) < max(1, effective_doc_limit - 1):
                 cap = min(cap, 1)
             if category_counts[category] >= cap:
                 rejection_notes.append(f"category-cap:{doc.get('title') or '[untitled]'}")
                 continue
             domain_cap = ((2 if broad_mode else 1) if effective_doc_limit <= 3 else (3 if broad_mode else 2))
+            if profile.get("tagPreferenceStrength", 0) > 0 and tag_match.get("hasAnyRequested"):
+                domain_cap += 1
             if source_tier == "weak":
                 domain_cap = 1
             if domain and domain_counts[domain] >= domain_cap:
@@ -1552,7 +1709,14 @@ class ReadwiseStore:
             if source_tier == "weak" and any(self._source_quality_tier(chosen) == "strong" and chosen.get("matchStrength", {}).get("titleSupport", 0) >= title_support for chosen in evidence_docs):
                 rejection_notes.append(f"weaker-source-displaced:{doc.get('title') or '[untitled]'}")
                 continue
-            chunks = self._clean_chunks(doc.get("contentChunks", []), limit=chunk_limit)
+            chunks = self._clean_chunks(
+                doc.get("contentChunks", []),
+                limit=chunk_limit,
+                query_profile=profile,
+                title=doc.get("title") or "",
+                summary=doc.get("summary") or "",
+                tags=tags,
+            )
             evidence_docs.append(
                 {
                     "documentId": doc.get("documentId"),
@@ -1577,6 +1741,7 @@ class ReadwiseStore:
                         "titleConcept": title_concept,
                         "tagConcept": tag_concept,
                         "summaryConcept": summary_concept,
+                        "requestedTagHits": tag_match.get("exactRequested", 0),
                     },
                     "selectionSignals": {
                         "hasManualTags": has_manual_tags,
@@ -1586,6 +1751,10 @@ class ReadwiseStore:
                         "conceptFamilyCoverage": family_coverage,
                         "titleDrift": title_drift,
                         "summaryDrift": summary_drift,
+                        "tagMatch": tag_match,
+                        "requestedTagTerms": profile.get("tagRequestedTerms") or [],
+                        "titleRequestedHits": sum(1 for tag in (profile.get("tagRequestedTerms") or []) if tag and tag in (doc.get("title") or "").lower()),
+                        "summaryRequestedHits": sum(1 for tag in (profile.get("tagRequestedTerms") or []) if tag and tag in (doc.get("summary") or "").lower()),
                     },
                     "chunks": chunks,
                 }
