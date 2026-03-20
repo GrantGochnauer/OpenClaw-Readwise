@@ -335,13 +335,21 @@ class ReadwiseStore:
         if not token_set:
             return 0
         bonus = 0
-        technical_terms = {"tenant", "multi-tenant", "multitenant", "authorization", "permissions", "policy", "policies", "security", "access", "control", "audit", "logging", "context", "identity", "boundary", "boundaries", "partition", "partitioning", "saas", "org", "organization"}
+        terms = query_profile.get("terms") or []
+        family_coverage = cls._concept_family_coverage(text, query_profile)
+        covered_families = sum(1 for value in family_coverage.values() if value > 0)
+        technical_terms = {"tenant", "multi-tenant", "multitenant", "authorization", "permissions", "policy", "policies", "security", "access", "control", "audit", "logging", "context", "identity", "boundary", "boundaries", "partition", "partitioning", "saas", "org", "organization", "row", "level"}
         technical_hits = len(token_set & technical_terms)
         bonus += min(technical_hits * 2, 12)
-        if "tenant" in (query_profile.get("terms") or []) and technical_hits >= 2:
+        bonus += covered_families * 6
+        if covered_families >= 2:
+            bonus += 10
+        if len(terms) >= 3 and covered_families >= 3:
+            bonus += 8
+        if "tenant" in terms and technical_hits >= 2:
             bonus += 4
-        if "isolation" in (query_profile.get("terms") or []) and ({"boundary", "boundaries", "partition", "partitioning", "separation", "sandbox"} & token_set):
-            bonus += 4
+        if "isolation" in terms and ({"boundary", "boundaries", "partition", "partitioning", "separation", "sandbox"} & token_set):
+            bonus += 8
         return bonus
 
     @classmethod
@@ -353,6 +361,46 @@ class ReadwiseStore:
         if len(norm_query) >= 4 and norm_query in norm_text:
             return 18
         return 0
+
+    @classmethod
+    def _technical_candidate_gate(cls, doc: Dict[str, Any], query_profile: Dict[str, Any]) -> Dict[str, Any]:
+        if query_profile.get("mode") != "specific_technical_compound":
+            return {"allow": True, "reason": "not-technical"}
+        terms = query_profile.get("terms") or []
+        text = " ".join(filter(None, [
+            doc.get("title") or "",
+            " ".join(doc.get("tags") or []),
+            doc.get("summary") or "",
+            (doc.get("content") or "")[:3000],
+        ]))
+        token_counts = cls._token_counts(text)
+        technical_term_hits = sum(1 for term in terms if term in token_counts)
+        family_coverage = cls._concept_family_coverage(text, query_profile)
+        covered_families = sum(1 for value in family_coverage.values() if value > 0)
+        title = (doc.get("title") or "").lower()
+        summary = (doc.get("summary") or "").lower()
+        title_summary = f"{title} {summary}"
+
+        if "full access" in title_summary and "row level" not in title_summary:
+            return {"allow": False, "reason": "full-access-literal-hijack", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
+        if "access point" in title_summary:
+            return {"allow": False, "reason": "access-point-hijack", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
+
+        if "tenant" in terms and "isolation" in terms:
+            has_tenant_context = any(tok in token_counts for tok in {"tenant", "tenants", "multi-tenant", "multitenant", "organization", "org", "saas"})
+            has_isolation_context = any(tok in token_counts for tok in {"isolation", "isolated", "boundary", "boundaries", "partition", "partitioning", "separation", "sandbox"})
+            if not (has_tenant_context and has_isolation_context):
+                return {"allow": False, "reason": "tenant-isolation-context-miss", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
+
+        if {"row", "level", "access", "control"}.issubset(set(terms)):
+            has_auth_context = any(tok in token_counts for tok in {"authorization", "authorizations", "permission", "permissions", "policy", "policies", "identity", "role", "roles", "rbac", "abac"})
+            has_data_context = any(tok in token_counts for tok in {"row", "rows", "table", "tables", "record", "records", "database", "postgres", "postgresql", "sql"})
+            if not (has_auth_context or has_data_context):
+                return {"allow": False, "reason": "row-level-access-context-miss", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
+
+        if technical_term_hits == 0 and covered_families == 0:
+            return {"allow": False, "reason": "technical-joint-support-miss", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
+        return {"allow": True, "reason": "ok", "technicalTermHits": technical_term_hits, "coveredFamilies": covered_families}
 
     @classmethod
     def _looks_like_digest(cls, doc: Dict[str, Any]) -> bool:
@@ -671,12 +719,19 @@ class ReadwiseStore:
             technical_term_hits = sum(1 for term in qterms if term in token_counts)
             family_coverage = self._concept_family_coverage(" ".join(filter(None, [title, summary, chunk_text, tag_text])), query_profile)
             covered_families = sum(1 for value in family_coverage.values() if value > 0)
+            partial_family_only = covered_families == 1 and technical_term_hits < max(2, min(len(qterms), 3))
             score += technical_term_hits * 6
             if technical_term_hits >= 2:
                 score += 10
             score += covered_families * 8
+            if covered_families >= 2:
+                score += 12
+            if len(qterms) >= 3 and covered_families >= 3:
+                score += 8
             if technical_term_hits <= 1 and covered_families <= 1:
                 score -= 26
+            if partial_family_only:
+                score -= 16
             if technical_term_hits < max(2, min(len(qterms), 3)):
                 score -= 12
             if covered_families == 0:
@@ -1299,6 +1354,7 @@ class ReadwiseStore:
                 (*tag_params, candidate_limit),
             ).fetchall()
 
+
         primary_rows = self.conn.execute(
             f"""
             SELECT *
@@ -1367,6 +1423,10 @@ class ReadwiseStore:
                 continue
             seen_ids.add(document_id)
             doc = self._row_to_document(row)
+            technical_gate = self._technical_candidate_gate(doc, profile)
+            if not technical_gate.get("allow", True):
+                continue
+            doc["technicalGate"] = technical_gate
             tag_match = self._tag_match_score(doc.get("tags") or [], profile)
             doc["tagMatch"] = tag_match
             doc["cacheScore"] = self._document_quality_score(doc, query=query, query_terms=query_terms)
@@ -1664,6 +1724,7 @@ class ReadwiseStore:
             technical_token_counts = self._token_counts(technical_context_text)
             technical_term_hits = sum(1 for term in query_terms if term in technical_token_counts)
             covered_families = sum(1 for value in family_coverage.values() if value > 0)
+            technical_gate = doc.get("technicalGate") or self._technical_candidate_gate(doc, profile)
 
             min_quality = 24 if has_manual_tags else 38
             if strict_mode:
@@ -1688,6 +1749,9 @@ class ReadwiseStore:
             if profile.get("mode") == "specific_technical_compound":
                 if technical_term_hits < max(2, min(len(query_terms), 3)) and covered_families < max(1, min(len(profile.get("conceptGroups") or {}), 2)):
                     rejection_notes.append(f"technical-joint-support-miss:{doc.get('title') or '[untitled]'}")
+                    continue
+                if covered_families <= 1 and technical_term_hits < max(2, min(len(query_terms), 3)) and source_tier != "strong":
+                    rejection_notes.append(f"technical-partial-family-match:{doc.get('title') or '[untitled]'}")
                     continue
                 if technical_term_hits <= 1 and (title_drift + summary_drift) >= 6:
                     rejection_notes.append(f"technical-drift:{doc.get('title') or '[untitled]'}")
@@ -1832,6 +1896,7 @@ class ReadwiseStore:
                         "summaryRequestedHits": sum(1 for tag in (profile.get("tagRequestedTerms") or []) if tag and tag in (doc.get("summary") or "").lower()),
                         "technicalQuery": profile.get("mode") == "specific_technical_compound",
                         "technicalContextTokens": sorted([term for term in query_terms if term in technical_token_counts])[:6],
+                        "technicalGate": technical_gate,
                     },
                     "chunks": chunks,
                 }
