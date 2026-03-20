@@ -1892,33 +1892,68 @@ class ReadwiseStore:
         evidence = self.build_evidence_set(query, doc_limit=max(limit, 4), highlight_limit=max(limit, 6), chunk_limit=1)
         docs = evidence.get("documents", [])
         highlights = evidence.get("highlights", [])
+        profile = evidence.get("queryProfile") or self._query_profile(query)
+        requested_tags = [self._normalize_token(tag) for tag in (profile.get("tagRequestedTerms") or []) if self._normalize_token(tag)]
+        requested_tag_set = set(requested_tags)
 
         tag_counts: Counter[str] = Counter()
+        adjacent_tag_counts: Counter[str] = Counter()
+        adjacent_tag_docs: Dict[str, set[str]] = {}
         term_counts: Counter[str] = Counter()
 
         for doc in docs:
-            for tag in doc.get("tags", []) or []:
+            doc_tags = [self._normalize_token(tag) for tag in (doc.get("tags", []) or []) if self._normalize_token(tag)]
+            tag_match = ((doc.get("selectionSignals") or {}).get("tagMatch") or {})
+            strong_requested_match = bool(tag_match.get("hasAnyRequested"))
+            doc_id = doc.get("documentId") or doc.get("title") or f"doc-{len(adjacent_tag_docs)}"
+            for tag in doc_tags:
                 if tag:
                     tag_counts[tag] += 1
+                    if requested_tag_set and tag not in requested_tag_set and strong_requested_match:
+                        adjacent_tag_counts[tag] += 2
+                        adjacent_tag_docs.setdefault(tag, set()).add(str(doc_id))
+                    elif requested_tag_set and tag not in requested_tag_set:
+                        adjacent_tag_counts[tag] += 1
+                        adjacent_tag_docs.setdefault(tag, set()).add(str(doc_id))
             corpus = " ".join(filter(None, [doc.get("title"), doc.get("summary")]))
             for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", corpus.lower()):
-                if token not in {"readwise", "reader", "openclaw", "with", "from", "that", "this", "your", "have", "more", "only", "into", "using"}:
-                    term_counts[token] += 1
+                norm = self._normalize_token(token)
+                if norm and norm not in STOP_TOKENS and norm not in LOW_SIGNAL_TOKENS and norm not in requested_tag_set and norm not in query.lower() and norm not in tag_counts:
+                    term_counts[norm] += 1
 
         for hl in highlights:
-            for tag in (hl.get("highlightTags", []) or []) + (hl.get("documentTags", []) or []):
-                if tag:
-                    tag_counts[tag] += 1
+            all_tags = (hl.get("highlightTags", []) or []) + (hl.get("documentTags", []) or [])
+            normalized_hl_tags = [self._normalize_token(tag) for tag in all_tags if self._normalize_token(tag)]
+            hl_id = hl.get("highlightId") or hl.get("documentId") or hl.get("documentTitle") or f"hl-{len(adjacent_tag_docs)}"
+            for tag in normalized_hl_tags:
+                tag_counts[tag] += 1
+                if requested_tag_set and tag not in requested_tag_set:
+                    adjacent_tag_counts[tag] += 1
+                    adjacent_tag_docs.setdefault(tag, set()).add(str(hl_id))
             corpus = " ".join(filter(None, [hl.get("documentTitle"), hl.get("highlightText")]))
             for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", corpus.lower()):
-                if token not in {"readwise", "reader", "openclaw", "with", "from", "that", "this", "your", "have", "more", "only", "into", "using"}:
-                    term_counts[token] += 1
+                norm = self._normalize_token(token)
+                if norm and norm not in STOP_TOKENS and norm not in LOW_SIGNAL_TOKENS and norm not in requested_tag_set and norm not in query.lower() and norm not in tag_counts:
+                    term_counts[norm] += 1
 
-        related_terms = [t for t, _ in term_counts.most_common(limit) if t not in query.lower()][:limit]
-        tags = [t for t, _ in tag_counts.most_common(limit)][:limit]
+        related_terms = [t for t, _ in term_counts.most_common(limit)][:limit]
+        exact_tags = [t for t, _ in tag_counts.most_common(limit) if t and t not in requested_tag_set][:limit]
+        adjacent_tags = [
+            tag for tag, _ in sorted(
+                adjacent_tag_counts.items(),
+                key=lambda item: (len(adjacent_tag_docs.get(item[0], set())), item[1], item[0]),
+                reverse=True,
+            )
+            if tag and tag not in requested_tag_set and len(adjacent_tag_docs.get(tag, set())) >= 1
+        ][:limit]
+
         suggested_queries = [query]
-        suggested_queries.extend([f"{query} tag:{tag}" for tag in tags[:3]])
-        suggested_queries.extend([f"{query} {term}" for term in related_terms[:3]])
+        if requested_tags:
+            suggested_queries.extend([f"{query} tag:{tag}" for tag in adjacent_tags[:3]])
+            suggested_queries.extend([f"show me docs tagged {tag}" for tag in adjacent_tags[:2]])
+        else:
+            suggested_queries.extend([f"{query} tag:{tag}" for tag in exact_tags[:3]])
+            suggested_queries.extend([f"{query} {term}" for term in related_terms[:3]])
 
         deduped_queries = []
         seen = set()
@@ -1931,8 +1966,10 @@ class ReadwiseStore:
         return {
             "kind": "expansionCandidates",
             "query": query,
+            "requestedTags": requested_tags,
             "relatedTerms": related_terms,
-            "relatedTags": tags,
+            "relatedTags": exact_tags,
+            "adjacentTags": adjacent_tags,
             "suggestedQueries": deduped_queries,
         }
 
